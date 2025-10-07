@@ -1,88 +1,84 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "common.h"
 
-// Simple user struct and global list (fine for phase1)
-typedef struct User {
-    char username[64];
-    size_t used_bytes;
-    size_t quota_bytes;
-    pthread_mutex_t lock;
-    struct User *next;
-} User;
+#define USERS_FILE "metadata/users.txt"
+#define STORAGE_DIR "storage"
 
-static User *users_head = NULL;
-static pthread_mutex_t users_mtx = PTHREAD_MUTEX_INITIALIZER;
+// ------------------------------------------------------------------
+// Utility: ensure a directory exists (creates if missing)
+// ------------------------------------------------------------------
+void ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        mkdir(path, 0755);
+    }
+}
 
-User* find_user(const char *username) {
-    pthread_mutex_lock(&users_mtx);
-    User *u = users_head;
-    while (u) {
-        if (strcmp(u->username, username) == 0) {
-            pthread_mutex_unlock(&users_mtx);
-            return u;
+// ------------------------------------------------------------------
+// Check if a username + password pair exists
+// ------------------------------------------------------------------
+int user_exists(const char *username, const char *password) {
+    FILE *f = fopen(USERS_FILE, "r");
+    if (!f) return 0;
+
+    char u[64], p[64];
+    while (fscanf(f, "%63s %63s", u, p) == 2) {
+        if (strcmp(u, username) == 0 && strcmp(p, password) == 0) {
+            fclose(f);
+            return 1;
         }
-        u = u->next;
     }
-    pthread_mutex_unlock(&users_mtx);
-    return NULL;
-}
-
-User* create_user_if_missing(const char *username) {
-    User *u = find_user(username);
-    if (u) return u;
-
-    u = malloc(sizeof(User));
-    strncpy(u->username, username, sizeof(u->username)-1);
-    u->username[sizeof(u->username)-1] = '\0';
-    u->used_bytes = 0;
-    u->quota_bytes = USER_QUOTA_BYTES;
-    pthread_mutex_init(&u->lock, NULL);
-    u->next = NULL;
-
-    pthread_mutex_lock(&users_mtx);
-    u->next = users_head;
-    users_head = u;
-    pthread_mutex_unlock(&users_mtx);
-
-    // ensure user storage directory exists
-    char dir[PATH_MAX_LEN];
-    snprintf(dir, sizeof(dir), "%s/%s", STORAGE_ROOT, username);
-    mkdir(STORAGE_ROOT, 0755); // ensure parent exists (ok if exists)
-    mkdir(dir, 0755);
-
-    return u;
-}
-
-int add_usage(const char *username, size_t bytes) {
-    User *u = create_user_if_missing(username);
-    pthread_mutex_lock(&u->lock);
-    if (u->used_bytes + bytes > u->quota_bytes) {
-        pthread_mutex_unlock(&u->lock);
-        return -1; // exceed
-    }
-    u->used_bytes += bytes;
-    pthread_mutex_unlock(&u->lock);
+    fclose(f);
     return 0;
 }
 
-void reduce_usage(const char *username, size_t bytes) {
-    User *u = create_user_if_missing(username);
-    pthread_mutex_lock(&u->lock);
-    if (bytes > u->used_bytes) u->used_bytes = 0;
-    else u->used_bytes -= bytes;
-    pthread_mutex_unlock(&u->lock);
+// ------------------------------------------------------------------
+// Register a new user; returns 1 on success, 0 if user already exists
+// ------------------------------------------------------------------
+int signup_user(const char *username, const char *password) {
+    // check if already exists
+    FILE *f = fopen(USERS_FILE, "r");
+    if (f) {
+        char u[64], p[64];
+        while (fscanf(f, "%63s %63s", u, p) == 2) {
+            if (strcmp(u, username) == 0) {
+                fclose(f);
+                return 0; // already exists
+            }
+        }
+        fclose(f);
+    }
+
+    // append new user to metadata file
+    f = fopen(USERS_FILE, "a");
+    if (!f) return 0;
+    fprintf(f, "%s %s\n", username, password);
+    fclose(f);
+
+    // create storage directory for this user
+    ensure_dir(STORAGE_DIR);
+
+    char user_dir[256];
+    snprintf(user_dir, sizeof(user_dir), "%s/%s", STORAGE_DIR, username);
+    ensure_dir(user_dir);
+
+    return 1;
 }
 
-size_t get_user_usage(const char *username) {
-    User *u = find_user(username);
-    if (!u) return 0;
-    pthread_mutex_lock(&u->lock);
-    size_t v = u->used_bytes;
-    pthread_mutex_unlock(&u->lock);
-    return v;
+// ------------------------------------------------------------------
+// Dummy quota tracking (Phase 2 will implement this)
+// ------------------------------------------------------------------
+void add_usage(const char *username, size_t amount) {
+    (void)username;
+    (void)amount;
+    // TODO: implement disk quota accounting later
+}
+
+void reduce_usage(const char *username, size_t amount) {
+    (void)username;
+    (void)amount;
+    // TODO: implement disk quota accounting later
 }

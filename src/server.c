@@ -2,310 +2,201 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <arpa/inet.h>
-#include <pthread.h>
+#include <netinet/in.h>
 #include <sys/stat.h>
-#include <errno.h>
-#include "common.h"
-
-// forward from threadpool.c
-void start_worker_pool();
+#include <dirent.h>
+#include "metadata.h"
 
 #define PORT 9000
-#define MAX_CLIENTS 10
-#define NUM_CLIENT_THREADS 3
+#define STORAGE_DIR "storage"
 
-extern Queue clientQueue;
-extern Queue taskQueue;
+void handle_client(int sock) {
+    char buf[1024];
+    char logged_in_user[64] = "";
 
-void *accept_loop(void *arg);
-void *client_thread(void *arg);
-void handle_client(int sock);
+    const char *welcome_msg =
+    "Welcome to MiniDropBox!\nCommands:\n"
+    "SIGNUP user pass\nLOGIN user pass\n"
+    "UPLOAD <username> <filename>\nDOWNLOAD <username> <filename>\n"
+    "DELETE <username> <filename>\nLIST <username>\nQUIT\n";
 
-int main(int argc, char **argv) {
-    int server_fd;
-    struct sockaddr_in addr;
+    send(sock, welcome_msg, strlen(welcome_msg), 0);
 
-    // ensure storage root exists
-    mkdir(STORAGE_ROOT, 0755);
+    while (1) {
+        memset(buf, 0, sizeof(buf));
+        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        buf[strcspn(buf, "\r\n")] = 0; // remove newline chars
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); exit(1); }
+        /* ---------- SIGNUP ---------- */
+        if (strncasecmp(buf, "SIGNUP", 6) == 0) {
+            char user[64] = {0}, pass[64] = {0};
+            if (sscanf(buf + 6,user, pass) == 2) {
+                signup_user(user, pass);
+            }
+            send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+            continue;
+        }
 
+        /* ---------- LOGIN ---------- */
+        if (strncasecmp(buf, "LOGIN", 5) == 0) {
+            char user[64] = {0}, pass[64] = {0};
+            if (sscanf(buf + 5,user, pass) == 2 &&
+                user_exists(user, pass)) {
+                strcpy(logged_in_user, user);
+                send(sock, "LOGIN OK\n", 9, 0);
+            } else {
+                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+            }
+            continue;
+        }
+
+        /* ---------- must be logged in ---------- */
+        if (strlen(logged_in_user) == 0) {
+            send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+            continue;
+        }
+
+        /* ---------- UPLOAD ---------- */
+        if (strncasecmp(buf, "UPLOAD", 6) == 0) {
+            char user[64] = {0}, filename[64] = {0};
+            if (sscanf(buf + 6, "%63s %63s", user, filename) != 2 ||
+                strcmp(user, logged_in_user) != 0) {
+                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                continue;
+            }
+
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s/%s", STORAGE_DIR, user, filename);
+            FILE *f = fopen(path, "wb");
+            if (!f) {
+                send(sock, "UPLOAD FAIL\n", 12, 0);
+                continue;
+            }
+
+            send(sock, "READY_FOR_DATA\n", 15, 0);
+            while ((n = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+                buf[n] = '\0';
+                if (strcmp(buf, "\r\n") == 0 || strcmp(buf, "\n") == 0)
+                    break;
+                fwrite(buf, 1, n, f);
+                if (strstr(buf, "\n")) break;
+            }
+            fclose(f);
+            send(sock, "UPLOAD OK\n", 10, 0);
+            continue;
+        }
+
+        /* ---------- DOWNLOAD ---------- */
+        if (strncasecmp(buf, "DOWNLOAD", 8) == 0) {
+            char user[64] = {0}, filename[64] = {0};
+            if (sscanf(buf + 8, "%63s %63s", user, filename) != 2 ||
+                strcmp(user, logged_in_user) != 0) {
+                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                continue;
+            }
+
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s/%s", STORAGE_DIR, user, filename);
+            FILE *f = fopen(path, "rb");
+            if (!f) {
+                send(sock, "DOWNLOAD FAIL\n", 14, 0);
+                continue;
+            }
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+                send(sock, buf, n, 0);
+            fclose(f);
+            send(sock, "\nDOWNLOAD OK\n", 13, 0);
+            continue;
+        }
+
+        /* ---------- DELETE ---------- */
+        if (strncasecmp(buf, "DELETE", 6) == 0) {
+            char user[64] = {0}, filename[64] = {0};
+            if (sscanf(buf + 6, "%63s %63s", user, filename) != 2 ||
+                strcmp(user, logged_in_user) != 0) {
+                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                continue;
+            }
+
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s/%s", STORAGE_DIR, user, filename);
+            if (remove(path) == 0)
+                send(sock, "DELETE OK\n", 10, 0);
+            else
+                send(sock, "DELETE FAIL\n", 12, 0);
+            continue;
+        }
+
+        /* ---------- LIST ---------- */
+        if (strncasecmp(buf, "LIST", 4) == 0) {
+            char user[64] = {0};
+            if (sscanf(buf + 4, "%63s", user) != 1 ||
+                strcmp(user, logged_in_user) != 0) {
+                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                continue;
+            }
+
+            char dirpath[256];
+            snprintf(dirpath, sizeof(dirpath), "%s/%s", STORAGE_DIR, user);
+            DIR *d = opendir(dirpath);
+            if (!d) {
+                send(sock, "LIST FAIL\n", 10, 0);
+                continue;
+            }
+            struct dirent *de;
+            while ((de = readdir(d))) {
+                if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) {
+                    char line[256];
+                    snprintf(line, sizeof(line), "%s\n", de->d_name);
+                    send(sock, line, strlen(line), 0);
+                }
+            }
+            closedir(d);
+            send(sock, "LIST OK\n", 8, 0);
+            continue;
+        }
+
+        /* ---------- QUIT ---------- */
+        if (strncasecmp(buf, "QUIT", 4) == 0) {
+            send(sock, "BYE\n", 4, 0);
+            break;
+        }
+
+        /* ---------- DEFAULT ---------- */
+        send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+    }
+
+    close(sock);
+}
+
+/* ---------- MAIN ---------- */
+int main() {
+    ensure_dir(STORAGE_DIR);
+    ensure_dir("metadata");
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
-    if (listen(server_fd, MAX_CLIENTS) < 0) { perror("listen"); exit(1); }
+    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
+    listen(server_fd, 5);
+    printf("Server running on port %d...\n", PORT);
 
-    printf("[Server] Listening on port %d...\n", PORT);
-
-    queue_init(&clientQueue, MAX_CLIENTS);
-    queue_init(&taskQueue, 100);
-
-    start_worker_pool();
-
-    pthread_t acceptThread;
-    pthread_create(&acceptThread, NULL, accept_loop, &server_fd);
-
-    pthread_t clientThreads[NUM_CLIENT_THREADS];
-    for (int i = 0; i < NUM_CLIENT_THREADS; i++)
-        pthread_create(&clientThreads[i], NULL, client_thread, NULL);
-
-    pthread_join(acceptThread, NULL);
-    close(server_fd);
-    return 0;
-}
-
-void *accept_loop(void *arg) {
-    int server_fd = *(int*)arg;
-    struct sockaddr_in client_addr;
-    socklen_t addrlen = sizeof(client_addr);
     while (1) {
-        int client_sock = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
-        if (client_sock < 0) {
-            perror("accept failed");
-            continue;
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) continue;
+        if (fork() == 0) {
+            close(server_fd);
+            handle_client(client_fd);
+            exit(0);
         }
-        printf("[Server] Accepted client socket: %d\n", client_sock);
-        queue_push(&clientQueue, (void*)(long)client_sock);
+        close(client_fd);
     }
-    return NULL;
-}
-
-// helper to read n bytes exactly
-static ssize_t readn(int fd, void *buf, size_t n) {
-    size_t total = 0;
-    char *p = buf;
-    while (total < n) {
-        ssize_t r = recv(fd, p + total, n - total, 0);
-        if (r <= 0) return r;
-        total += r;
-    }
-    return total;
-}
-
-// client thread loop
-void *client_thread(void *arg) {
-    (void)arg;
-    while (1) {
-        int client_sock = (int)(long)queue_pop(&clientQueue);
-        handle_client(client_sock);
-    }
-    return NULL;
-}
-
-void send_line(int sock, const char *s) {
-    send(sock, s, strlen(s), 0);
-}
-
-void handle_client(int sock) {
-    char buf[4096];
-    send_line(sock, "Welcome to MiniDropBox!\nCommands:\nSIGNUP user pass\nLOGIN user pass\nUPLOAD <username> <filename>\\n<filesize>\\n<bytes>\nDOWNLOAD <username> <filename>\nDELETE <username> <filename>\nLIST <username>\n");
-    while (1) {
-        int n = recv(sock, buf, sizeof(buf)-1, 0);
-        if (n <= 0) break;
-        buf[n] = '\0';
-        // trim newline
-        char *p = buf;
-        while (*p && (*p=='\r' || *p=='\n')) p++;
-        // parse command
-        char cmd[32], username[64], filename[256];
-        int ret = sscanf(buf, "%31s %63s %255s", cmd, username, filename);
-        if (ret < 1) continue;
-
-        if (strcasecmp(cmd, "UPLOAD") == 0) {
-            if (ret < 3) { send_line(sock, "ERROR: UPLOAD requires username and filename\n"); continue; }
-            // next: read a line containing filesize
-            send_line(sock, "READY_FOR_SIZE\n");
-            int m = recv(sock, buf, sizeof(buf)-1, 0);
-            if (m <= 0) break;
-            buf[m] = '\0';
-            long filesize = atol(buf);
-            if (filesize <= 0) { send_line(sock, "ERROR: invalid size\n"); continue; }
-
-            // prepare tmp path
-            char tmppath[PATH_MAX_LEN];
-            snprintf(tmppath, sizeof(tmppath), "%s/%s.upload.%d.tmp", STORAGE_ROOT, username, (int)getpid());
-            // ensure user temp dir exists
-            char userdir[PATH_MAX_LEN];
-            snprintf(userdir, sizeof(userdir), "%s/%s", STORAGE_ROOT, username);
-            mkdir(STORAGE_ROOT, 0755);
-            mkdir(userdir, 0755);
-
-            FILE *f = fopen(tmppath, "wb");
-            if (!f) {
-                send_line(sock, "ERROR: cannot create tmp\n");
-                continue;
-            }
-            // read exactly filesize bytes
-            long remaining = filesize;
-            char buf2[8192];
-            while (remaining > 0) {
-                ssize_t toread = remaining > (long)sizeof(buf2) ? sizeof(buf2) : remaining;
-                ssize_t r = readn(sock, buf2, toread);
-                if (r <= 0) { fclose(f); unlink(tmppath); goto client_end; }
-                fwrite(buf2, 1, r, f);
-                remaining -= r;
-            }
-            fclose(f);
-
-            // create task and wait for worker
-            Task *t = malloc(sizeof(Task));
-            memset(t,0,sizeof(Task));
-            t->type = T_UPLOAD;
-            strncpy(t->username, username, sizeof(t->username)-1);
-            strncpy(t->filename, filename, sizeof(t->filename)-1);
-            t->client_sock = sock;
-            strncpy(t->tmp_path, tmppath, sizeof(t->tmp_path)-1);
-            pthread_mutex_init(&t->resp_mtx, NULL);
-            pthread_cond_init(&t->resp_cond, NULL);
-            t->done = 0;
-
-            queue_push(&taskQueue, t);
-
-            // wait for worker
-            pthread_mutex_lock(&t->resp_mtx);
-            while (!t->done) pthread_cond_wait(&t->resp_cond, &t->resp_mtx);
-            pthread_mutex_unlock(&t->resp_mtx);
-
-            if (t->status == 0) send_line(sock, "UPLOAD OK\n");
-            else {
-                char tmp[512];
-                snprintf(tmp, sizeof(tmp), "UPLOAD ERROR: %s\n", t->errmsg);
-                send_line(sock, tmp);
-            }
-            // cleanup
-            pthread_mutex_destroy(&t->resp_mtx);
-            pthread_cond_destroy(&t->resp_cond);
-            free(t);
-        }
-        else if (strcasecmp(cmd, "DOWNLOAD") == 0) {
-            if (ret < 3) { send_line(sock, "ERROR: DOWNLOAD requires username and filename\n"); continue; }
-            Task *t = malloc(sizeof(Task));
-            memset(t,0,sizeof(Task));
-            t->type = T_DOWNLOAD;
-            strncpy(t->username, username, sizeof(t->username)-1);
-            strncpy(t->filename, filename, sizeof(t->filename)-1);
-            t->client_sock = sock;
-            pthread_mutex_init(&t->resp_mtx, NULL);
-            pthread_cond_init(&t->resp_cond, NULL);
-            t->done = 0;
-
-            queue_push(&taskQueue, t);
-
-            // wait for worker
-            pthread_mutex_lock(&t->resp_mtx);
-            while (!t->done) pthread_cond_wait(&t->resp_cond, &t->resp_mtx);
-            pthread_mutex_unlock(&t->resp_mtx);
-
-            if (t->status == 0) {
-                // open tmp file and send size + bytes
-                struct stat st;
-                if (stat(t->tmp_path, &st) == 0) {
-                    char header[64];
-                    snprintf(header, sizeof(header), "%zu\n", (size_t)st.st_size);
-                    send(sock, header, strlen(header), 0);
-                    FILE *f = fopen(t->tmp_path, "rb");
-                    if (f) {
-                        char buf3[8192];
-                        size_t r;
-                        while ((r = fread(buf3,1,sizeof(buf3), f)) > 0) {
-                            send(sock, buf3, r, 0);
-                        }
-                        fclose(f);
-                    }
-                    unlink(t->tmp_path);
-                } else {
-                    send_line(sock, "DOWNLOAD ERROR: cannot stat tmp\n");
-                }
-            } else {
-                char tmp[512];
-                snprintf(tmp, sizeof(tmp), "DOWNLOAD ERROR: %s\n", t->errmsg);
-                send_line(sock, tmp);
-            }
-            pthread_mutex_destroy(&t->resp_mtx);
-            pthread_cond_destroy(&t->resp_cond);
-            free(t);
-        }
-        else if (strcasecmp(cmd, "DELETE") == 0) {
-            if (ret < 3) { send_line(sock, "ERROR: DELETE requires username and filename\n"); continue; }
-            Task *t = malloc(sizeof(Task));
-            memset(t,0,sizeof(Task));
-            t->type = T_DELETE;
-            strncpy(t->username, username, sizeof(t->username)-1);
-            strncpy(t->filename, filename, sizeof(t->filename)-1);
-            t->client_sock = sock;
-            pthread_mutex_init(&t->resp_mtx, NULL);
-            pthread_cond_init(&t->resp_cond, NULL);
-            t->done = 0;
-
-            queue_push(&taskQueue, t);
-
-            pthread_mutex_lock(&t->resp_mtx);
-            while (!t->done) pthread_cond_wait(&t->resp_cond, &t->resp_mtx);
-            pthread_mutex_unlock(&t->resp_mtx);
-
-            if (t->status == 0) send_line(sock, "DELETE OK\n");
-            else {
-                char tmp[512];
-                snprintf(tmp, sizeof(tmp), "DELETE ERROR: %s\n", t->errmsg);
-                send_line(sock, tmp);
-            }
-            pthread_mutex_destroy(&t->resp_mtx);
-            pthread_cond_destroy(&t->resp_cond);
-            free(t);
-        }
-        else if (strcasecmp(cmd, "LIST") == 0) {
-            if (ret < 2) { send_line(sock, "ERROR: LIST requires username\n"); continue; }
-            // here username is in cmd args (we read as first arg)
-            // if second arg present it was parsed; adjust
-            Task *t = malloc(sizeof(Task));
-            memset(t,0,sizeof(Task));
-            t->type = T_LIST;
-            strncpy(t->username, username, sizeof(t->username)-1);
-            t->client_sock = sock;
-            pthread_mutex_init(&t->resp_mtx, NULL);
-            pthread_cond_init(&t->resp_cond, NULL);
-            t->done = 0;
-
-            queue_push(&taskQueue, t);
-
-            pthread_mutex_lock(&t->resp_mtx);
-            while (!t->done) pthread_cond_wait(&t->resp_cond, &t->resp_mtx);
-            pthread_mutex_unlock(&t->resp_mtx);
-
-            if (t->status == 0) {
-                // send list file contents
-                FILE *f = fopen(t->tmp_path, "r");
-                if (f) {
-                    char lbuf[1024];
-                    while (fgets(lbuf, sizeof(lbuf), f)) {
-                        send(sock, lbuf, strlen(lbuf), 0);
-                    }
-                    fclose(f);
-                    unlink(t->tmp_path);
-                } else {
-                    send_line(sock, "LIST OK (empty)\n");
-                }
-            } else {
-                char tmp[512];
-                snprintf(tmp, sizeof(tmp), "LIST ERROR: %s\n", t->errmsg);
-                send_line(sock, tmp);
-            }
-            pthread_mutex_destroy(&t->resp_mtx);
-            pthread_cond_destroy(&t->resp_cond);
-            free(t);
-        }
-        else if (strcasecmp(cmd, "QUIT") == 0 || strcasecmp(cmd, "EXIT")==0) {
-            send_line(sock, "BYE\n");
-            break;
-        }
-        else {
-            send_line(sock, "Unknown command\n");
-        }
-    }
-client_end:
-    close(sock);
 }
