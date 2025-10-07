@@ -1,14 +1,24 @@
+# Compiler and flags
 CC = gcc
-CFLAGS = -pthread -g -O0
-SRC = $(wildcard src/*.c)
+CFLAGS = -pthread -g -O0 -Wall -Wextra
+SRC = src/metadata.c src/queue.c src/server.c src/threadpool.c
+OBJ = $(SRC:.c=.o)
 TARGET = server
 
+# Default build
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
-test_client: tests/single_client_test.c
-	$(CC) -g -o tests/single_client_test tests/single_client_test.c
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJ)
 
+# Run the server
+run: $(TARGET)
+	./$(TARGET)
+
+# Run server under Valgrind for leak detection
+valgrind: $(TARGET)
+	valgrind --leak-check=full --show-leak-kinds=all ./$(TARGET)
+
+# Clean up build artifacts
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) $(OBJ)
