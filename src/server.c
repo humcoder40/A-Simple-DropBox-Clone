@@ -18,10 +18,10 @@ void handle_client(int sock) {
     char logged_in_user[64] = "";
 
     const char *welcome_msg =
-    "Welcome to MiniDropBox!\nCommands:\n"
-    "SIGNUP user pass\nLOGIN user pass\n"
-    "UPLOAD <username> <filename>\nDOWNLOAD <username> <filename>\n"
-    "DELETE <username> <filename>\nLIST <username>\nQUIT\n";
+        "Welcome to MiniDropBox!\nCommands:\n"
+        "SIGNUP user pass\nLOGIN user pass\n"
+        "UPLOAD <username> <filename>\nDOWNLOAD <username> <filename>\n"
+        "DELETE <username> <filename>\nLIST <username>\nQUIT\n";
 
     send(sock, welcome_msg, strlen(welcome_msg), 0);
 
@@ -30,43 +30,45 @@ void handle_client(int sock) {
         int n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
         buf[n] = '\0';
-        buf[strcspn(buf, "\r\n")] = 0; // remove newline chars
+        buf[strcspn(buf, "\r\n")] = 0; // remove newline
 
-        /* ---------- SIGNUP ---------- */
+        // ---------- SIGNUP ----------
         if (strncasecmp(buf, "SIGNUP", 6) == 0) {
             char user[64] = {0}, pass[64] = {0};
-            if (sscanf(buf + 6,user, pass) == 2) {
+            if (sscanf(buf + 6, "%63s %63s", user, pass) == 2) {
                 signup_user(user, pass);
+                send(sock, "SIGNUP OK\n", 10, 0);
+            } else {
+                send(sock, "Usage: SIGNUP user pass\n", 24, 0);
             }
-            send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
             continue;
         }
 
-        /* ---------- LOGIN ---------- */
+        // ---------- LOGIN ----------
         if (strncasecmp(buf, "LOGIN", 5) == 0) {
             char user[64] = {0}, pass[64] = {0};
-            if (sscanf(buf + 5,user, pass) == 2 &&
+            if (sscanf(buf + 5, "%63s %63s", user, pass) == 2 &&
                 user_exists(user, pass)) {
                 strcpy(logged_in_user, user);
                 send(sock, "LOGIN OK\n", 9, 0);
             } else {
-                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                send(sock, "INVALID CREDENTIALS\n", 20, 0);
             }
             continue;
         }
 
-        /* ---------- must be logged in ---------- */
+        // ---------- must be logged in ----------
         if (strlen(logged_in_user) == 0) {
             send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
             continue;
         }
 
-        /* ---------- UPLOAD ---------- */
+        // ---------- UPLOAD ----------
         if (strncasecmp(buf, "UPLOAD", 6) == 0) {
             char user[64] = {0}, filename[64] = {0};
             if (sscanf(buf + 6, "%63s %63s", user, filename) != 2 ||
                 strcmp(user, logged_in_user) != 0) {
-                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                send(sock, "PERMISSION DENIED\n", 18, 0);
                 continue;
             }
 
@@ -79,10 +81,8 @@ void handle_client(int sock) {
             }
 
             send(sock, "READY_FOR_DATA\n", 15, 0);
-            while ((n = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
-                buf[n] = '\0';
-                if (strcmp(buf, "\r\n") == 0 || strcmp(buf, "\n") == 0)
-                    break;
+            while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
+                if (strcmp(buf, "END\n") == 0) break;
                 fwrite(buf, 1, n, f);
                 if (strstr(buf, "\n")) break;
             }
@@ -91,12 +91,12 @@ void handle_client(int sock) {
             continue;
         }
 
-        /* ---------- DOWNLOAD ---------- */
+        // ---------- DOWNLOAD ----------
         if (strncasecmp(buf, "DOWNLOAD", 8) == 0) {
             char user[64] = {0}, filename[64] = {0};
             if (sscanf(buf + 8, "%63s %63s", user, filename) != 2 ||
                 strcmp(user, logged_in_user) != 0) {
-                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                send(sock, "PERMISSION DENIED\n", 18, 0);
                 continue;
             }
 
@@ -114,12 +114,12 @@ void handle_client(int sock) {
             continue;
         }
 
-        /* ---------- DELETE ---------- */
+        // ---------- DELETE ----------
         if (strncasecmp(buf, "DELETE", 6) == 0) {
             char user[64] = {0}, filename[64] = {0};
             if (sscanf(buf + 6, "%63s %63s", user, filename) != 2 ||
                 strcmp(user, logged_in_user) != 0) {
-                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                send(sock, "PERMISSION DENIED\n", 18, 0);
                 continue;
             }
 
@@ -132,12 +132,12 @@ void handle_client(int sock) {
             continue;
         }
 
-        /* ---------- LIST ---------- */
+        // ---------- LIST ----------
         if (strncasecmp(buf, "LIST", 4) == 0) {
             char user[64] = {0};
             if (sscanf(buf + 4, "%63s", user) != 1 ||
                 strcmp(user, logged_in_user) != 0) {
-                send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+                send(sock, "PERMISSION DENIED\n", 18, 0);
                 continue;
             }
 
@@ -161,14 +161,14 @@ void handle_client(int sock) {
             continue;
         }
 
-        /* ---------- QUIT ---------- */
+        // ---------- QUIT ----------
         if (strncasecmp(buf, "QUIT", 4) == 0) {
             send(sock, "BYE\n", 4, 0);
             break;
         }
 
-        /* ---------- DEFAULT ---------- */
-        send(sock, "PLEASE LOGIN FIRST\n", 19, 0);
+        // ---------- UNKNOWN ----------
+        send(sock, "UNKNOWN COMMAND\n", 16, 0);
     }
 
     close(sock);
