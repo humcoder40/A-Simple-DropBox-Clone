@@ -8,10 +8,21 @@
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <dirent.h>
-#include "metadata.h"
+#include <pthread.h>
 
+#include "metadata.h"
+#include "queue.h"
+
+// keep macro names consistent with your original repo
 #define PORT 9000
 #define STORAGE_DIR "storage"
+
+// forward: worker pool start (implemented in threadpool.c)
+void start_worker_pool(void);
+
+// extern queues declared in threadpool.c
+extern Queue clientQueue;
+extern Queue taskQueue;
 
 void handle_client(int sock) {
     char buf[1024];
@@ -27,7 +38,7 @@ void handle_client(int sock) {
 
     while (1) {
         memset(buf, 0, sizeof(buf));
-        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
         buf[n] = '\0';
         buf[strcspn(buf, "\r\n")] = 0; // remove newline
@@ -72,7 +83,12 @@ void handle_client(int sock) {
                 continue;
             }
 
-            char path[256];
+            // create user dir if missing
+            char userdir[256];
+            snprintf(userdir, sizeof(userdir), "%s/%s", STORAGE_DIR, user);
+            ensure_dir(userdir);
+
+            char path[512];
             snprintf(path, sizeof(path), "%s/%s/%s", STORAGE_DIR, user, filename);
             FILE *f = fopen(path, "wb");
             if (!f) {
@@ -82,9 +98,14 @@ void handle_client(int sock) {
 
             send(sock, "READY_FOR_DATA\n", 15, 0);
             while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
-                if (strcmp(buf, "END\n") == 0) break;
+                // simple protocol: client sends "END\n" on its own line to finish
+                if (n >= 4 && strcmp(buf, "END\n") == 0) break;
                 fwrite(buf, 1, n, f);
-                if (strstr(buf, "\n")) break;
+                // if less than buffer or contains newline, continue read until END
+                if (n < (ssize_t)sizeof(buf)) {
+                    // keep reading until END or close
+                    continue;
+                }
             }
             fclose(f);
             send(sock, "UPLOAD OK\n", 10, 0);
@@ -100,7 +121,7 @@ void handle_client(int sock) {
                 continue;
             }
 
-            char path[256];
+            char path[512];
             snprintf(path, sizeof(path), "%s/%s/%s", STORAGE_DIR, user, filename);
             FILE *f = fopen(path, "rb");
             if (!f) {
@@ -123,7 +144,7 @@ void handle_client(int sock) {
                 continue;
             }
 
-            char path[256];
+            char path[512];
             snprintf(path, sizeof(path), "%s/%s/%s", STORAGE_DIR, user, filename);
             if (remove(path) == 0)
                 send(sock, "DELETE OK\n", 10, 0);
@@ -141,7 +162,7 @@ void handle_client(int sock) {
                 continue;
             }
 
-            char dirpath[256];
+            char dirpath[512];
             snprintf(dirpath, sizeof(dirpath), "%s/%s", STORAGE_DIR, user);
             DIR *d = opendir(dirpath);
             if (!d) {
@@ -174,29 +195,86 @@ void handle_client(int sock) {
     close(sock);
 }
 
-/* ---------- MAIN ---------- */
+/* thread wrapper for client handling */
+void *client_thread(void *arg) {
+    int sock = *((int *)arg);
+    free(arg);
+    handle_client(sock);
+    return NULL;
+}
+
+/* MAIN */
 int main() {
+    // create storage / metadata dirs
     ensure_dir(STORAGE_DIR);
     ensure_dir("metadata");
 
+    // init queues (capacities chosen reasonably)
+    queue_init(&clientQueue, 128);
+    queue_init(&taskQueue, 256);
+
+    // start worker pool that services taskQueue
+    start_worker_pool();
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {0};
+    if (server_fd < 0) {
+        perror("socket");
+        exit(1);
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(server_fd, 5);
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        exit(1);
+    }
+
+    if (listen(server_fd, 128) < 0) {
+        perror("listen");
+        close(server_fd);
+        exit(1);
+    }
+
     printf("Server running on port %d...\n", PORT);
 
     while (1) {
         int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) continue;
-        if (fork() == 0) {
-            close(server_fd);
-            handle_client(client_fd);
-            exit(0);
+        if (client_fd < 0) {
+            perror("accept");
+            continue;
         }
-        close(client_fd);
+
+        // create detached thread per client (supports many concurrent clients)
+        int *pclient = malloc(sizeof(int));
+        if (!pclient) {
+            close(client_fd);
+            continue;
+        }
+        *pclient = client_fd;
+
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&tid, &attr, client_thread, pclient) != 0) {
+            perror("pthread_create");
+            free(pclient);
+            close(client_fd);
+        }
+        pthread_attr_destroy(&attr);
     }
+
+    close(server_fd);
+    return 0;
 }
