@@ -5,29 +5,30 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <limits.h>
 #include "common.h"
 #include "queue.h"
 
-// declare global queues
+/* declare global queues (defined elsewhere) */
 Queue clientQueue;
 Queue taskQueue;
 
 #define NUM_WORKERS 3
 
-// forward declaration for metadata functions (from metadata.c)
+/* forward declaration for metadata functions (from metadata.c) */
 User* create_user_if_missing(const char *username);
 int add_usage(const char *username, size_t bytes);
 void reduce_usage(const char *username, size_t bytes);
 
-// helper: build final path
+/* helper: build final path */
 static void final_path(char *out, size_t out_sz, const char *username, const char *filename) {
     snprintf(out, out_sz, "%s/%s/%s", STORAGE_ROOT, username, filename);
 }
 
-// safe rename/move tmp -> final
+/* safe rename/move tmp -> final */
 static int move_tmp_to_final(const char *tmp, const char *final) {
     if (rename(tmp, final) == 0) return 0;
-    // fallback: copy then unlink
+    /* fallback: copy then unlink */
     FILE *in = fopen(tmp, "rb");
     if (!in) return -1;
     FILE *out = fopen(final, "wb");
@@ -40,8 +41,79 @@ static int move_tmp_to_final(const char *tmp, const char *final) {
     return 0;
 }
 
+/* ---------------------------
+   Lock-table implementation
+   ---------------------------
+   Simple chained-list map: key -> pthread_mutex_t
+   Keys are strings. Access protected by lock_table_mtx.
+   Entries are never removed (keeps life simple).
+*/
+
+typedef struct LockNode {
+    char *key;                  /* dynamically allocated key string */
+    pthread_mutex_t mtx;        /* the mutex for this key */
+    struct LockNode *next;
+} LockNode;
+
+static LockNode *lock_table_head = NULL;
+static pthread_mutex_t lock_table_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* build key helpers */
+static void build_user_key(char *out, size_t out_sz, const char *username) {
+    snprintf(out, out_sz, "U:%s", username);
+}
+static void build_file_key(char *out, size_t out_sz, const char *username, const char *filename) {
+    snprintf(out, out_sz, "F:%s/%s", username, filename);
+}
+
+/* find or create a lock node for the given key, returns pointer to node->mtx */
+static pthread_mutex_t *get_lock_for_key(const char *key) {
+    pthread_mutex_lock(&lock_table_mtx);
+    LockNode *cur = lock_table_head;
+    while (cur) {
+        if (strcmp(cur->key, key) == 0) {
+            pthread_mutex_unlock(&lock_table_mtx);
+            return &cur->mtx;
+        }
+        cur = cur->next;
+    }
+    /* not found -> create */
+    LockNode *node = malloc(sizeof(LockNode));
+    if (!node) {
+        pthread_mutex_unlock(&lock_table_mtx);
+        return NULL;
+    }
+    node->key = strdup(key);
+    if (!node->key) {
+        free(node);
+        pthread_mutex_unlock(&lock_table_mtx);
+        return NULL;
+    }
+    pthread_mutex_init(&node->mtx, NULL);
+    node->next = lock_table_head;
+    lock_table_head = node;
+    pthread_mutex_unlock(&lock_table_mtx);
+    return &node->mtx;
+}
+
+/* public helpers used inside this file */
+static pthread_mutex_t *get_lock_for_user(const char *username) {
+    char key[PATH_MAX];
+    build_user_key(key, sizeof(key), username);
+    return get_lock_for_key(key);
+}
+
+static pthread_mutex_t *get_lock_for_file(const char *username, const char *filename) {
+    char key[PATH_MAX];
+    build_file_key(key, sizeof(key), username, filename);
+    return get_lock_for_key(key);
+}
+
+/* ---------------------------
+   Handlers (unchanged logic)
+   --------------------------- */
+
 static void handle_upload(Task *t) {
-    // t->tmp_path must contain path to the file written by client thread
     struct stat st;
     if (stat(t->tmp_path, &st) != 0) {
         t->status = -1;
@@ -50,7 +122,7 @@ static void handle_upload(Task *t) {
     }
     size_t fsize = st.st_size;
 
-    // check quota and update metadata
+    /* check quota and update metadata */
     if (add_usage(t->username, fsize) != 0) {
         t->status = -2;
         snprintf(t->errmsg, sizeof(t->errmsg), "quota exceeded");
@@ -58,15 +130,15 @@ static void handle_upload(Task *t) {
         return;
     }
 
-    // ensure user dir
+    /* ensure user dir */
     char final[PATH_MAX_LEN];
     final_path(final, sizeof(final), t->username, t->filename);
 
-    // move tmp -> final
+    /* move tmp -> final */
     if (move_tmp_to_final(t->tmp_path, final) != 0) {
         t->status = -3;
         snprintf(t->errmsg, sizeof(t->errmsg), "move failed: %s", strerror(errno));
-        // revert usage
+        /* revert usage */
         reduce_usage(t->username, fsize);
         unlink(t->tmp_path);
         return;
@@ -85,7 +157,7 @@ static void handle_download(Task *t) {
         return;
     }
 
-    // create a temp file to store the copy worker will produce for client thread to read
+    /* create a temp file to store the copy worker will produce for client thread to read */
     char outtmp[PATH_MAX_LEN];
     snprintf(outtmp, sizeof(outtmp), "%s/%s.download.%d.tmp", STORAGE_ROOT, t->username, (int)getpid());
     FILE *in = fopen(final, "rb");
@@ -96,7 +168,7 @@ static void handle_download(Task *t) {
     size_t r;
     while ((r = fread(buf,1,sizeof(buf), in)) > 0) fwrite(buf,1,r,out);
     fclose(in); fclose(out);
-    // worker fills tmp_path with outtmp, client thread will read and send file and then unlink it
+    /* worker fills tmp_path with outtmp, client thread will read and send file and then unlink it */
     strncpy(t->tmp_path, outtmp, sizeof(t->tmp_path)-1);
     t->status = 0;
 }
@@ -121,7 +193,7 @@ static void handle_delete(Task *t) {
 }
 
 static void handle_list(Task *t) {
-    // produce a small temporary listing file with one line per file: name size
+    /* produce a small temporary listing file with one line per file: name size */
     char dir[PATH_MAX_LEN];
     snprintf(dir, sizeof(dir), "%s/%s", STORAGE_ROOT, t->username);
     FILE *out;
@@ -129,7 +201,7 @@ static void handle_list(Task *t) {
     snprintf(outtmp, sizeof(outtmp), "%s/%s.list.%d.tmp", STORAGE_ROOT, t->username, (int)getpid());
     out = fopen(outtmp, "w");
     if (!out) { t->status = -1; snprintf(t->errmsg, sizeof(t->errmsg), "list tmp create fail"); return; }
-    // iterate directory
+    /* iterate directory */
     #include <dirent.h>
     struct dirent *de;
     DIR *dr = opendir(dir);
@@ -155,13 +227,26 @@ static void handle_list(Task *t) {
     t->status = 0;
 }
 
+/* worker thread: pop a task, acquire appropriate lock, run handler, signal client */
 static void *worker_thread(void *arg) {
     (void)arg;
     while (1) {
         Task *t = (Task*) queue_pop(&taskQueue);
-        // perform requested operation
         if (!t) continue;
-        // perform operation
+
+        /* choose lock: file-level for upload/download/delete, user-level for list */
+        pthread_mutex_t *lock = NULL;
+        if (t->type == T_LIST) {
+            lock = get_lock_for_user(t->username);
+        } else {
+            /* for upload/download/delete use file-level lock */
+            lock = get_lock_for_file(t->username, t->filename);
+        }
+
+        /* lock if available (if get_lock returns NULL, we still try to run but that's an error) */
+        if (lock) pthread_mutex_lock(lock);
+
+        /* perform requested operation */
         switch (t->type) {
             case T_UPLOAD: handle_upload(t); break;
             case T_DOWNLOAD: handle_download(t); break;
@@ -171,12 +256,17 @@ static void *worker_thread(void *arg) {
                 t->status = -99;
                 snprintf(t->errmsg, sizeof(t->errmsg), "unknown task");
         }
-        // signal client thread waiting on this task
+
+        /* release lock */
+        if (lock) pthread_mutex_unlock(lock);
+
+        /* signal client thread waiting on this task */
         pthread_mutex_lock(&t->resp_mtx);
         t->done = 1;
         pthread_cond_signal(&t->resp_cond);
         pthread_mutex_unlock(&t->resp_mtx);
-        // worker does not free t here: client thread will free it after sending data back
+
+        /* worker does not free t here: client thread will free it after sending data back */
     }
     return NULL;
 }
@@ -187,3 +277,4 @@ void start_worker_pool() {
         pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
 }
+
