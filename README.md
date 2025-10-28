@@ -31,3 +31,15 @@ make clean
 make
 make run
 
+for manual valgrind
+# 1️⃣ build normally first
+make
+# 2️⃣ run server under valgrind
+valgrind --leak-check=full --show-leak-kinds=all ./src/server 9000
+
+for manual tsan
+# 1️⃣ build tsan version
+gcc -fsanitize=thread -g -pthread src/metadata.c src/queue.c src/server.c src/threadpool.c -o src/server_tsan
+# 2️⃣ run it
+TSAN_OPTIONS="suppressions=tsan.supp" ./src/server_tsan 9000
+
