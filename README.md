@@ -17,3 +17,17 @@ quit
 to check memory leak before running "./server"
 valgrind --leak-check=full --show-leak-kinds=all ./server
 
+to compile the test script file
+chmod +x full_test.sh
+
+no as we have done valgrind and tsan testing automatic so we combined all concurrency,valgrind and tsan
+u do that by simply writing 
+make clean
+make
+make test
+
+to do manual command run u do
+make clean
+make
+make run
+
