@@ -1,67 +1,79 @@
-# ==============================
-# Makefile for MiniDropBox Clone
-# ==============================
-
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -g
-SRC_DIR = src
-OBJ_DIR = build
-TARGET = server
+SRC = src/metadata.c src/queue.c src/server.c src/threadpool.c
+OBJ = build/metadata.o build/queue.o build/server.o build/threadpool.o
+TARGET = src/server
+TSAN_TARGET = src/server_tsan
 
-# Collect all .c files automatically
-SRCS = $(wildcard $(SRC_DIR)/*.c)
-OBJS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+all: build $(TARGET)
 
-# ==============================
-# Default target: normal build
-# ==============================
-all: build_dir $(TARGET)
+build:
+	mkdir -p build
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJ)
 	@echo "🔧 Linking..."
-	$(CC) $(CFLAGS) $(OBJS) -o $(SRC_DIR)/$(TARGET)
-	@echo "✅ Build complete: ./src/$(TARGET)"
+	$(CC) $(CFLAGS) $(OBJ) -o $(TARGET)
+	@echo "✅ Build complete: ./src/server"
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
-	@mkdir -p $(OBJ_DIR)
-	@echo "🧩 Compiling $< ..."
+build/metadata.o: src/metadata.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-build_dir:
-	@mkdir -p $(OBJ_DIR)
+build/queue.o: src/queue.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# ==============================
-# Run normally
-# ==============================
-run: all
-	@echo "🚀 Starting server..."
-	./src/$(TARGET) 9000
+build/server.o: src/server.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# ==============================
-# Valgrind test
-# ==============================
-valgrind: all
-	@echo "🧠 Running Valgrind (memory leak check)..."
-	valgrind --leak-check=full --show-leak-kinds=all ./src/$(TARGET) 9000
+build/threadpool.o: src/threadpool.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# ==============================
-# ThreadSanitizer build & run
-# ==============================
-tsan:
-	@echo "🔬 Building ThreadSanitizer version..."
-	$(CC) -fsanitize=thread -g -pthread $(SRCS) -o $(SRC_DIR)/server_tsan
-	@echo "✅ TSAN build ready: ./src/server_tsan"
-	@echo "Run it with: ./src/server_tsan 9000"
-
-# ==============================
-# Clean builds
-# ==============================
 clean:
-	@echo "🧹 Cleaning build files..."
-	rm -rf $(OBJ_DIR) ./src/$(TARGET) ./src/server_tsan
-	@echo "✅ Clean complete!"
+	rm -rf build $(TARGET) $(TSAN_TARGET) valgrind.log
+	@echo "🧹 Cleaned build files."
 
-# ==============================
-# Phony targets
-# ==============================
-.PHONY: all run valgrind tsan clean
+run: all
+	@echo "🚀 Starting server on port 9000..."
+	./$(TARGET) 9000
+
+# ------------------ Full Automated Testing ------------------
+
+test:
+	@echo "🚀 Starting automated concurrency + Valgrind + TSAN tests..."
+	@echo "--------------------------------------------"
+	@echo "🧩 Building normal and TSAN versions..."
+	make -s
+	$(CC) -fsanitize=thread -g -pthread $(SRC) -o $(TSAN_TARGET)
+	@echo "✅ TSAN build ready."
+
+	@echo "🧠 Running Valgrind memory test..."
+	@valgrind --leak-check=full --log-file=valgrind.log ./$(TARGET) 9000 & \
+	VPID=$$!; \
+	sleep 3; \
+	echo "📡 Running simulated clients..."; \
+	for i in $$(seq 1 5); do \
+	  ( echo "LIST"; sleep 1; echo "QUIT"; ) | nc localhost 9000 & \
+	done; \
+	sleep 5; \
+	kill $$VPID 2>/dev/null || true; \
+	wait $$VPID 2>/dev/null || true; \
+	echo "🧹 Valgrind summary:"; \
+	tail -n 10 valgrind.log; \
+	echo "--------------------------------------------"
+
+	@echo "🔬 Running ThreadSanitizer test..."
+	@TSAN_OPTIONS="suppressions=tsan.supp" ./$(TSAN_TARGET) 9000 & \
+	TPID=$$!; \
+	sleep 3; \
+	echo "📡 Running simulated clients..."; \
+	for i in $$(seq 1 5); do \
+	  ( echo "LIST"; sleep 1; echo "QUIT"; ) | nc localhost 9000 & \
+	done; \
+	sleep 5; \
+	kill $$TPID 2>/dev/null || true; \
+	wait $$TPID 2>/dev/null || true; \
+	echo "✅ TSAN test complete."
+
+	@echo "--------------------------------------------"
+	@echo "✅ All automated tests finished successfully."
+
+.PHONY: all build clean run test

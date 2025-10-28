@@ -277,4 +277,3 @@ void start_worker_pool() {
         pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
 }
-
